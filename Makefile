@@ -7,7 +7,7 @@ X11_LIBS      := $(shell pkg-config --libs x11)
 CURSES_CFLAGS := $(shell pkg-config --cflags ncurses)
 CURSES_LIBS   := $(shell pkg-config --libs ncurses)
 
-SRC := src/main.c src/core.c src/segments.c src/ui_x11.c src/ui_tui.c
+SRC := src/main.c src/core.c src/segments.c src/eyes.c src/ui_x11.c src/ui_tui.c
 OBJ := $(SRC:.c=.o)
 BIN := clock
 
@@ -25,7 +25,8 @@ $(BIN): $(OBJ)
 src/main.o:     src/core.h src/ui.h
 src/core.o:     src/core.h
 src/segments.o: src/segments.h
-src/ui_x11.o:   src/ui.h src/core.h src/segments.h
+src/eyes.o:     src/eyes.h
+src/ui_x11.o:   src/ui.h src/core.h src/segments.h src/eyes.h
 src/ui_tui.o:   src/ui.h src/core.h src/segments.h
 
 install: $(BIN)

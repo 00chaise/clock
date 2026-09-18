@@ -170,7 +170,7 @@ int main(int argc, char **argv)
         #undef NEED_VALUE
     }
 
-    /* Les durees peuvent avoir change apres app_init. */
+    // Les durees peuvent avoir change apres app_init. 
     if (app.phase == PH_IDLE) {
         app.total = app.work_len;
         app.remaining = app.work_len;

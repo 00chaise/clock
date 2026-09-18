@@ -1,5 +1,8 @@
+#define _POSIX_C_SOURCE 199309L
+
 #include "ui.h"
 #include "segments.h"
+#include "eyes.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -11,7 +14,17 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
+
+/* X11 sans compositeur ne sait pas melanger deux couleurs a la volee : pour
+ * faire disparaitre les chiffres en douceur quand les yeux arrivent, on
+ * prepare a l'avance quelques teintes intermediaires vers le fond. */
+#define FADE_STEPS 8
+
+typedef struct {
+    unsigned long step[FADE_STEPS];   /* step[0] = fond, step[n-1] = couleur pleine */
+} Fade;
 
 typedef struct {
     Display *dpy;
@@ -25,8 +38,17 @@ typedef struct {
     int      wx, wy;          /* position courante de la fenetre */
     bool     dragging;
     int      drag_dx, drag_dy;
-    unsigned long c_bg, c_panel, c_dim, c_text, c_accent, c_flash;
+    unsigned long c_bg, c_panel, c_eye;
+    Fade     f_accent, f_flash, f_dim, f_panel, f_text;
+    Eyes     eyes;
 } X11Ui;
+
+static long now_millis(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 static unsigned long alloc_color(Display *dpy, int screen, const char *spec)
 {
@@ -35,6 +57,29 @@ static unsigned long alloc_color(Display *dpy, int screen, const char *spec)
     if (XParseColor(dpy, cm, spec, &c) && XAllocColor(dpy, cm, &c))
         return c.pixel;
     return WhitePixel(dpy, screen);
+}
+
+static void make_fade(Display *dpy, int screen, const char *from,
+                      const char *to, Fade *f)
+{
+    Colormap cm = DefaultColormap(dpy, screen);
+    XColor a, b;
+
+    if (!XParseColor(dpy, cm, from, &a) || !XParseColor(dpy, cm, to, &b)) {
+        for (int i = 0; i < FADE_STEPS; i++)
+            f->step[i] = WhitePixel(dpy, screen);
+        return;
+    }
+
+    for (int i = 0; i < FADE_STEPS; i++) {
+        double u = (double)i / (double)(FADE_STEPS - 1);
+        XColor c;
+        c.red   = (unsigned short)((double)a.red   + ((double)b.red   - (double)a.red)   * u);
+        c.green = (unsigned short)((double)a.green + ((double)b.green - (double)a.green) * u);
+        c.blue  = (unsigned short)((double)a.blue  + ((double)b.blue  - (double)a.blue)  * u);
+        c.flags = DoRed | DoGreen | DoBlue;
+        f->step[i] = XAllocColor(dpy, cm, &c) ? c.pixel : WhitePixel(dpy, screen);
+    }
 }
 
 static XFontStruct *load_any_font(Display *dpy)
@@ -164,25 +209,98 @@ static void draw_digits(X11Ui *u, const char *s, int ax, int ay, int aw, int ah,
     }
 }
 
-static unsigned long phase_color(X11Ui *u, const App *a)
+/* Un oeil : soit un arc souriant, soit un ovale avec sa pupille, soit une
+ * simple paupiere horizontale quand il est ferme. */
+static void draw_eye(X11Ui *u, int cx, int cy, int r, double open,
+                     double gaze, double smile)
 {
-    if (a->mode == MODE_CLOCK)
-        return u->c_accent;
-    switch (a->phase) {
-    case PH_WORK:  return u->c_flash;
-    case PH_SHORT:
-    case PH_LONG:  return u->c_dim;
-    default:       return u->c_accent;
+    if (r < 3)
+        return;
+
+    if (smile > 0.01) {
+        int th = (int)(r * 0.32);
+        if (th < 2)
+            th = 2;
+        int rr = (int)(r * 0.95 * smile);
+        if (rr < 2)
+            return;
+        XSetForeground(u->dpy, u->gc, u->c_eye);
+        XSetLineAttributes(u->dpy, u->gc, th, LineSolid, CapRound, JoinRound);
+        /* Ellipse plus large que haute : un oeil plisse est aplati, un demi
+         * cercle donnerait une arche de pont. */
+        int ah = (int)(rr * 1.15);
+        XDrawArc(u->dpy, u->buf, u->gc, cx - rr, cy - ah / 2, 2 * rr, ah,
+                 0, 180 * 64);
+        XSetLineAttributes(u->dpy, u->gc, 1, LineSolid, CapButt, JoinMiter);
+        return;
+    }
+
+    int lid = (int)(r * 0.26);
+    if (lid < 2)
+        lid = 2;
+    int eh = (int)(2.0 * r * open);
+
+    if (eh <= lid) {
+        fill(u, u->c_eye, cx - r, cy - lid / 2, 2 * r, lid);
+        return;
+    }
+
+    XSetForeground(u->dpy, u->gc, u->c_eye);
+    XFillArc(u->dpy, u->buf, u->gc, cx - r, cy - eh / 2, 2 * r, eh, 0, 360 * 64);
+
+    /* La pupille suit le regard et s'aplatit avec la paupiere. */
+    int pr = (int)(r * 0.42);
+    int ph = (int)(2.0 * pr * open);
+    if (ph > eh - lid)
+        ph = eh - lid;
+    if (pr >= 2 && ph >= 2) {
+        int px = cx + (int)(gaze * r * 0.40);
+        XSetForeground(u->dpy, u->gc, u->c_bg);
+        XFillArc(u->dpy, u->buf, u->gc, px - pr, cy - ph / 2,
+                 2 * pr, ph, 0, 360 * 64);
     }
 }
 
-static void redraw(X11Ui *u, App *a, time_t now, int frame)
+static void draw_eyes(X11Ui *u, const EyeFrame *f, int ax, int ay, int aw, int ah)
+{
+    int rmax = (int)(ah * 0.42);
+    if (rmax > aw / 5)
+        rmax = aw / 5;
+
+    /* Les yeux grandissent en apparaissant au lieu de surgir d'un coup. */
+    int r = (int)(rmax * (0.55 + 0.45 * f->presence));
+    if (r < 3)
+        return;
+
+    int cx = ax + aw / 2;
+    int cy = ay + ah / 2;
+    int dx = (int)(r * 1.35);
+
+    draw_eye(u, cx - dx, cy, r, f->open_l, f->gaze, f->smile);
+    draw_eye(u, cx + dx, cy, r, f->open_r, f->gaze, f->smile);
+}
+
+static const Fade *phase_fade(const X11Ui *u, const App *a)
+{
+    if (a->mode == MODE_CLOCK)
+        return &u->f_accent;
+    switch (a->phase) {
+    case PH_WORK:  return &u->f_flash;
+    case PH_SHORT:
+    case PH_LONG:  return &u->f_dim;
+    default:       return &u->f_accent;
+    }
+}
+
+static void redraw(X11Ui *u, App *a, time_t now, long now_ms)
 {
     int pad = 14;
     unsigned long bg = u->c_bg;
 
-    /* Clignotement discret quand une alarme ou une phase vient de tomber. */
-    if (a->flash && (frame / 3) % 2 == 0)
+    /* Clignotement discret quand une alarme ou une phase vient de tomber.
+     * Base sur l'horloge et non sur le numero d'image : la cadence change
+     * pendant les animations. */
+    if (a->flash && (now_ms / 450) % 2 == 0)
         bg = u->c_panel;
 
     fill(u, bg, 0, 0, u->w, u->h);
@@ -195,29 +313,47 @@ static void redraw(X11Ui *u, App *a, time_t now, int frame)
     if (digits_h < 20)
         digits_h = u->h - 2 * pad;
 
-    unsigned long lit = phase_color(u, a);
+    EyeFrame ef;
+    bool eyes = eyes_frame(&u->eyes, now_ms, &ef);
 
-    char text[32];
-    app_display(a, now, text, sizeof(text));
-    draw_digits(u, text, pad, pad, u->w - 2 * pad, digits_h, lit, u->c_panel);
+    /* L'horloge s'efface a mesure que les yeux prennent sa place. */
+    double vis = eyes ? 1.0 - ef.presence : 1.0;
+    int k = (int)(vis * (FADE_STEPS - 1) + 0.5);
+    if (k < 0)
+        k = 0;
+    if (k > FADE_STEPS - 1)
+        k = FADE_STEPS - 1;
 
-    /* Barre d'avancement : pleine largeur en pomodoro, rien en horloge. */
-    if (a->mode == MODE_POMODORO && a->phase != PH_IDLE) {
-        int bw = u->w - 2 * pad;
-        fill(u, u->c_panel, pad, bar_y, bw, bar_h);
-        fill(u, lit, pad, bar_y, (int)(bw * app_progress(a)), bar_h);
+    if (k > 0) {
+        const Fade *pf = phase_fade(u, a);
+        unsigned long lit = pf->step[k];
+        unsigned long dim = u->f_panel.step[k];
+
+        char text[32];
+        app_display(a, now, text, sizeof(text));
+        draw_digits(u, text, pad, pad, u->w - 2 * pad, digits_h, lit, dim);
+
+        /* Barre d'avancement : pleine largeur en pomodoro, rien en horloge. */
+        if (a->mode == MODE_POMODORO && a->phase != PH_IDLE) {
+            int bw = u->w - 2 * pad;
+            fill(u, dim, pad, bar_y, bw, bar_h);
+            fill(u, lit, pad, bar_y, (int)(bw * app_progress(a)), bar_h);
+        }
+
+        if (u->font) {
+            char sub[96];
+            app_subtitle(a, now, sub, sizeof(sub));
+            int tw = XTextWidth(u->font, sub, (int)strlen(sub));
+            XSetForeground(u->dpy, u->gc, u->f_text.step[k]);
+            XSetFont(u->dpy, u->gc, u->font->fid);
+            XDrawString(u->dpy, u->buf, u->gc,
+                        (u->w - tw) / 2, u->h - pad - u->font->descent,
+                        sub, (int)strlen(sub));
+        }
     }
 
-    if (u->font) {
-        char sub[96];
-        app_subtitle(a, now, sub, sizeof(sub));
-        int tw = XTextWidth(u->font, sub, (int)strlen(sub));
-        XSetForeground(u->dpy, u->gc, u->c_text);
-        XSetFont(u->dpy, u->gc, u->font->fid);
-        XDrawString(u->dpy, u->buf, u->gc,
-                    (u->w - tw) / 2, u->h - pad - u->font->descent,
-                    sub, (int)strlen(sub));
-    }
+    if (eyes)
+        draw_eyes(u, &ef, pad, pad, u->w - 2 * pad, digits_h);
 
     XCopyArea(u->dpy, u->buf, u->win, u->gc, 0, 0, u->w, u->h, 0, 0);
     XFlush(u->dpy);
@@ -246,12 +382,15 @@ int ui_x11_run(App *a, const UiOptions *o)
     }
     u.screen = DefaultScreen(u.dpy);
 
-    u.c_bg     = alloc_color(u.dpy, u.screen, "#12141c");
-    u.c_panel  = alloc_color(u.dpy, u.screen, "#232839");
-    u.c_dim    = alloc_color(u.dpy, u.screen, "#9ece6a");
-    u.c_text   = alloc_color(u.dpy, u.screen, "#7f88a3");
-    u.c_accent = alloc_color(u.dpy, u.screen, "#7aa2f7");
-    u.c_flash  = alloc_color(u.dpy, u.screen, "#f7768e");
+    u.c_bg    = alloc_color(u.dpy, u.screen, "#12141c");
+    u.c_panel = alloc_color(u.dpy, u.screen, "#232839");
+    u.c_eye   = alloc_color(u.dpy, u.screen, "#e8ecf5");
+
+    make_fade(u.dpy, u.screen, "#12141c", "#7aa2f7", &u.f_accent);
+    make_fade(u.dpy, u.screen, "#12141c", "#f7768e", &u.f_flash);
+    make_fade(u.dpy, u.screen, "#12141c", "#9ece6a", &u.f_dim);
+    make_fade(u.dpy, u.screen, "#12141c", "#232839", &u.f_panel);
+    make_fade(u.dpy, u.screen, "#12141c", "#7f88a3", &u.f_text);
 
     int x = o->has_pos ? o->x : 60;
     int y = o->has_pos ? o->y : 60;
@@ -290,8 +429,9 @@ int ui_x11_run(App *a, const UiOptions *o)
     XMapWindow(u.dpy, u.win);
     resize_buffer(&u, o->width, o->height);
 
+    eyes_init(&u.eyes, now_millis());
+
     int fd = ConnectionNumber(u.dpy);
-    int frame = 0;
     time_t last_tick = 0;
 
     while (!a->quit) {
@@ -312,6 +452,8 @@ int ui_x11_run(App *a, const UiOptions *o)
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
                 if (ks == XK_Escape)
                     a->quit = true;
+                else if (ks == XK_e)
+                    eyes_trigger(&u.eyes, now_millis());
                 else if (ks == XK_space)
                     app_key(a, ' ');
                 else if (ks < 128)
@@ -351,16 +493,22 @@ int ui_x11_run(App *a, const UiOptions *o)
             break;
 
         time_t now = time(NULL);
+        long now_ms = now_millis();
+
         if (now != last_tick) {
             app_tick(a, now);
             last_tick = now;
         }
-        redraw(&u, a, now, frame++);
+
+        eyes_update(&u.eyes, now_ms, u.dragging || a->flash);
+        redraw(&u, a, now, now_ms);
 
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
-        struct timeval tv = { 0, 150000 };   /* 150 ms : assez fluide */
+        /* Une horloge n'a pas besoin de plus de 6 images par seconde, mais
+         * une animation, si : on accelere seulement pendant. */
+        struct timeval tv = { 0, eyes_active(&u.eyes) ? 33000 : 150000 };
         select(fd + 1, &rfds, NULL, NULL, &tv);
     }
 
