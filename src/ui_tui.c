@@ -1,16 +1,25 @@
 #include "ui.h"
 #include "segments.h"
+#include "eyes.h"
 
 #include <ncurses.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 /* La geometrie est calculee dans une grille virtuelle puis etiree x2 en
  * colonnes : une cellule terminal fait environ deux fois plus haut que large,
  * donc sans ca les chiffres seraient ecrases. */
 #define XSCALE 2
 
-enum { CP_ACCENT = 1, CP_WORK, CP_BREAK, CP_TEXT, CP_DIM };
+enum { CP_ACCENT = 1, CP_WORK, CP_BREAK, CP_TEXT, CP_DIM, CP_EYE };
+
+static long now_millis(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 static void fill_cells(const SegRect *r, int ox, int oy, int pair)
 {
@@ -72,6 +81,104 @@ static void draw_digits(const char *s, int oy, int rows, int cols, int pair, int
     }
 }
 
+/* Les yeux du widget X11, transposes en cellules. Tout se teste en
+ * coordonnees d'ellipse, (dx/a)^2 + (dy/b)^2 <= 1 : pas de sqrt(), donc pas
+ * de -lm a ajouter a l'edition de liens pour trois animations. */
+static bool in_ellipse(double dx, double dy, double a, double b)
+{
+    /* Une demi cellule en moins sur chaque rayon : sinon la pointe de
+     * l'ellipse allume une cellule toute seule, qui ressemble a une antenne
+     * plantee sur l'oeil. */
+    a -= 0.5;
+    b -= 0.5;
+    if (a < 0.5 || b < 0.5)
+        return false;
+    double u = dx / a, v = dy / b;
+    return u * u + v * v <= 1.0;
+}
+
+/* ry est le rayon vertical en lignes ; le rayon horizontal vaut XSCALE fois
+ * plus, sinon l'oeil serait un ovale couche. */
+static void draw_eye(int cy, int cx, int ry, double open, double gaze,
+                     double smile, int pair)
+{
+    double rx = (double)ry * XSCALE;
+
+    attron(COLOR_PAIR(pair) | A_REVERSE);
+
+    if (smile > 0.01) {
+        /* L'arc, c'est une ellipse aplatie moins la meme retrecie de
+         * l'epaisseur du trait, dont on ne garde que la moitie haute. */
+        double r = ry * 0.95 * smile;
+        double sx = r * XSCALE, sy = r * 0.575;
+        /* Trait plus fin que dans le widget X11 : l'arc ne fait que quatre
+         * lignes de haut, l'epaisseur d'origine le remplirait entierement. */
+        double th = ry * 0.20;
+        if (th < 1.0)
+            th = 1.0;
+        for (int dy = -(int)sy - 1; dy <= 0; dy++) {
+            for (int dx = -(int)sx - 1; dx <= (int)sx + 1; dx++) {
+                if (in_ellipse(dx, dy, sx, sy) &&
+                    !in_ellipse(dx, dy, sx - th * XSCALE, sy - th))
+                    mvaddch(cy + dy, cx + dx, ' ');
+            }
+        }
+        attroff(COLOR_PAIR(pair) | A_REVERSE);
+        return;
+    }
+
+    double lid = ry * 0.26;
+    if (lid < 1.0)
+        lid = 1.0;
+    double eh = 2.0 * ry * open;
+
+    if (eh <= lid) {
+        /* Oeil ferme : il ne reste que la paupiere, un trait. */
+        int half = (int)(lid / 2.0);
+        for (int dy = -half; dy <= half; dy++)
+            for (int dx = -(int)rx; dx <= (int)rx; dx++)
+                mvaddch(cy + dy, cx + dx, ' ');
+        attroff(COLOR_PAIR(pair) | A_REVERSE);
+        return;
+    }
+
+    /* La pupille suit le regard et s'aplatit avec la paupiere. */
+    double ey = eh / 2.0;
+    double prx = rx * 0.42, pry = ry * 0.42 * open;
+    if (2.0 * pry > eh - lid)
+        pry = (eh - lid) / 2.0;
+    double px = gaze * rx * 0.40;
+
+    for (int dy = -(int)ey - 1; dy <= (int)ey + 1; dy++) {
+        for (int dx = -(int)rx - 1; dx <= (int)rx + 1; dx++) {
+            if (in_ellipse(dx, dy, rx, ey) &&
+                !in_ellipse(dx - px, dy, prx, pry))
+                mvaddch(cy + dy, cx + dx, ' ');
+        }
+    }
+    attroff(COLOR_PAIR(pair) | A_REVERSE);
+}
+
+static void draw_eyes(const EyeFrame *f, int oy, int rows, int cols)
+{
+    int ry = (int)(rows * 0.42);
+    int fit = cols / (5 * XSCALE);
+    if (ry > fit)
+        ry = fit;
+
+    /* Les yeux grandissent en apparaissant au lieu de surgir d'un coup. */
+    ry = (int)(ry * (0.55 + 0.45 * f->presence));
+    if (ry < 2)
+        return;
+
+    int cy = oy + rows / 2;
+    int cx = cols / 2;
+    int gap = (int)(ry * 1.35 * XSCALE);
+
+    draw_eye(cy, cx - gap, ry, f->open_l, f->gaze, f->smile, CP_EYE);
+    draw_eye(cy, cx + gap, ry, f->open_r, f->gaze, f->smile, CP_EYE);
+}
+
 static int phase_pair(const App *a)
 {
     if (a->mode == MODE_CLOCK)
@@ -84,7 +191,7 @@ static int phase_pair(const App *a)
     }
 }
 
-static void redraw(App *a, time_t now, int frame)
+static void redraw(App *a, const Eyes *eyes, time_t now, long now_ms, int frame)
 {
     erase();
 
@@ -95,29 +202,40 @@ static void redraw(App *a, time_t now, int frame)
     if (a->flash && (frame / 3) % 2 == 0)
         pair = CP_TEXT;
 
-    char text[32];
-    app_display(a, now, text, sizeof(text));
-    draw_digits(text, 1, rows - 5, cols, pair, CP_DIM);
+    EyeFrame ef;
+    bool open = eyes_frame(eyes, now_ms, &ef);
 
-    if (a->mode == MODE_POMODORO && a->phase != PH_IDLE) {
-        int bw = cols - 4;
-        int done = (int)(bw * app_progress(a));
-        int by = rows - 4;
-        attron(COLOR_PAIR(CP_DIM) | A_REVERSE);
-        for (int i = 0; i < bw; i++)
-            mvaddch(by, 2 + i, ' ');
-        attroff(COLOR_PAIR(CP_DIM) | A_REVERSE);
-        attron(COLOR_PAIR(pair) | A_REVERSE);
-        for (int i = 0; i < done; i++)
-            mvaddch(by, 2 + i, ' ');
-        attroff(COLOR_PAIR(pair) | A_REVERSE);
+    /* L'heure s'efface quand les yeux prennent sa place. Le widget X11 fait
+     * un fondu de couleur, impossible ici : on bascule d'un coup a mi
+     * apparition, soit environ un dixieme de seconde apres le debut. */
+    if (!open || ef.presence < 0.5) {
+        char text[32];
+        app_display(a, now, text, sizeof(text));
+        draw_digits(text, 1, rows - 5, cols, pair, CP_DIM);
+
+        if (a->mode == MODE_POMODORO && a->phase != PH_IDLE) {
+            int bw = cols - 4;
+            int done = (int)(bw * app_progress(a));
+            int by = rows - 4;
+            attron(COLOR_PAIR(CP_DIM) | A_REVERSE);
+            for (int i = 0; i < bw; i++)
+                mvaddch(by, 2 + i, ' ');
+            attroff(COLOR_PAIR(CP_DIM) | A_REVERSE);
+            attron(COLOR_PAIR(pair) | A_REVERSE);
+            for (int i = 0; i < done; i++)
+                mvaddch(by, 2 + i, ' ');
+            attroff(COLOR_PAIR(pair) | A_REVERSE);
+        }
+
+        char sub[96];
+        app_subtitle(a, now, sub, sizeof(sub));
+        attron(COLOR_PAIR(CP_TEXT) | A_BOLD);
+        mvaddstr(rows - 2, (cols - (int)strlen(sub)) / 2, sub);
+        attroff(COLOR_PAIR(CP_TEXT) | A_BOLD);
     }
 
-    char sub[96];
-    app_subtitle(a, now, sub, sizeof(sub));
-    attron(COLOR_PAIR(CP_TEXT) | A_BOLD);
-    mvaddstr(rows - 2, (cols - (int)strlen(sub)) / 2, sub);
-    attroff(COLOR_PAIR(CP_TEXT) | A_BOLD);
+    if (open)
+        draw_eyes(&ef, 1, rows - 5, cols);
 
     const char *help = "espace demarrer/pause  n suivant  r reset  m mode  s secondes  q quitter";
     if ((int)strlen(help) < cols) {
@@ -146,7 +264,11 @@ int ui_tui_run(App *a)
         init_pair(CP_BREAK,  COLOR_GREEN, -1);
         init_pair(CP_TEXT,   COLOR_YELLOW, -1);
         init_pair(CP_DIM,    COLOR_BLACK, -1);
+        init_pair(CP_EYE,    COLOR_WHITE, -1);
     }
+
+    Eyes eyes;
+    eyes_init(&eyes, now_millis());
 
     int frame = 0;
     time_t last_tick = 0;
@@ -155,15 +277,25 @@ int ui_tui_run(App *a)
         int ch = getch();
         if (ch == 27)              /* Echap */
             a->quit = true;
+        else if (ch == 'e' || ch == 'E')
+            eyes_trigger(&eyes, now_millis());
         else if (ch != ERR && ch < 128)
             app_key(a, ch);
 
         time_t now = time(NULL);
+        long now_ms = now_millis();
+
         if (now != last_tick) {
             app_tick(a, now);
             last_tick = now;
         }
-        redraw(a, now, frame++);
+
+        eyes_update(&eyes, now_ms, a->flash);
+        /* Une horloge se contente de six images par seconde, une animation
+         * non : on n'accelere que le temps de l'apparition. */
+        timeout(eyes_active(&eyes) ? 33 : 150);
+
+        redraw(a, &eyes, now, now_ms, frame++);
     }
 
     endwin();

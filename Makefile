@@ -27,7 +27,7 @@ src/core.o:     src/core.h
 src/segments.o: src/segments.h
 src/eyes.o:     src/eyes.h
 src/ui_x11.o:   src/ui.h src/core.h src/segments.h src/eyes.h
-src/ui_tui.o:   src/ui.h src/core.h src/segments.h
+src/ui_tui.o:   src/ui.h src/core.h src/segments.h src/eyes.h
 
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
